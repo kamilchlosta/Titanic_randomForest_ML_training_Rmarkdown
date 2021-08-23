@@ -1,0 +1,667 @@
+---
+title: 'Titanic - ML training'
+author: 'Kamil Chłosta'
+date: '12 August 2021'
+output:
+  html_document:
+    number_sections: true
+    toc: true
+    fig_width: 7
+    fig_height: 4.5
+    theme: readable
+    highlight: tango
+---
+
+# Introduction
+```{r, include=FALSE}
+tree_func <- function(final_model, 
+                      tree_num) {
+  
+  # get tree by index
+  tree <- randomForest::getTree(final_model, 
+                                k = tree_num, 
+                                labelVar = TRUE) %>%
+    tibble::rownames_to_column() %>%
+    # make leaf split points to NA, so the 0s won't get plotted
+    mutate(`split point` = ifelse(is.na(prediction), `split point`, NA))
+  
+  # prepare data frame for graph
+  graph_frame <- data.frame(from = rep(tree$rowname, 2),
+                            to = c(tree$`left daughter`, tree$`right daughter`))
+  
+  # convert to graph and delete the last node that we don't want to plot
+  graph <- graph_from_data_frame(graph_frame) %>%
+    delete_vertices("0")
+  
+  # set node labels
+  V(graph)$node_label <- gsub("_", " ", as.character(tree$`split var`))
+  V(graph)$leaf_label <- as.character(tree$prediction)
+  V(graph)$split <- as.character(round(tree$`split point`, digits = 2))
+  
+  # plot
+  plot <- ggraph(graph, 'dendrogram') + 
+    theme_bw() +
+    geom_edge_link() +
+    geom_node_point() +
+    geom_node_text(aes(label = node_label), na.rm = TRUE, repel = TRUE) +
+    geom_node_label(aes(label = split), vjust = 2.5, na.rm = TRUE, fill = "white") +
+    geom_node_label(aes(label = leaf_label, fill = leaf_label), na.rm = TRUE, 
+					repel = TRUE, colour = "white", fontface = "bold", show.legend = FALSE) +
+    theme(panel.grid.minor = element_blank(),
+          panel.grid.major = element_blank(),
+          panel.background = element_blank(),
+          plot.background = element_rect(fill = "white"),
+          panel.border = element_blank(),
+          axis.line = element_blank(),
+          axis.text.x = element_blank(),
+          axis.text.y = element_blank(),
+          axis.ticks = element_blank(),
+          axis.title.x = element_blank(),
+          axis.title.y = element_blank(),
+          plot.title = element_text(size = 18))
+  
+  print(plot)
+}
+
+setwd('D:/DataScience/Kaggle/Titanic')
+```
+
+## Libraries, loading and checking data
+```{r setup, message=FALSE, warning=FALSE}
+library(caret)
+library(ggthemes)
+library(scales)
+library(mice)
+library(stringr)
+library(randomForest)
+library(ggraph)
+library(igraph)
+library(ggplot2)
+library(dplyr)
+library(e1071)
+
+train <- read.csv("Data/train.csv")
+test <- read.csv("Data/test.csv")
+
+tt <- bind_rows(train, test)
+```
+
+```{r codeoptions}
+# Disable scientific notation in R
+options(scipen = 999)
+
+# Set the graphical theme in ggplot2 library
+ggplot2::theme_set(ggplot2::theme_light())
+
+# Set global knitr chunk options - avoids cluttered unnecessary info about warnings/messages
+knitr::opts_chunk$set(
+  warning = FALSE, 
+  message = FALSE
+)
+```
+
+## First data insights and data wrangling
+Checking up data types and getting basic statistical info
+```{r firstlook, echo=FALSE}
+tt %>% str()
+tt %>% summary()
+```
+
+Changing some numerical data to categorical
+```{r datatype}
+tt$Sex <- as.factor(tt$Sex)
+tt$Pclass <- as.factor(tt$Pclass)
+tt$Embarked <- as.factor(tt$Embarked)
+tt$Survived <- as.factor(tt$Survived)
+```
+
+## Visualizing the data
+Insight:
+  There are significantly more males present onboard
+  Kids and females are favoured
+  There is one old person that survived - consider getting rid of it to avoid higher age bias.
+  There is higher probability that the people from class 1 and 2 survived - age has an impact but seems neglectable
+
+```{r FirstGraphs, echo=FALSE, message=FALSE, warning=FALSE}
+ggplot(tt %>% tidyr::drop_na(Survived), aes(x = Sex, fill = Survived))+
+  geom_bar(aes(y = ..count..))+
+  geom_text(stat='count', aes(label=..count..), vjust=-0.5, alpha = 0.5)+
+  labs(subtitle = "Survival by sex")
+
+ggplot(tt, aes(x=Age, fill = Sex)) +
+  geom_density(alpha = 0.5)+
+  labs(subtitle = "Age distribution by sex")
+
+ggplot(tt %>% tidyr::drop_na(Survived) %>% filter(Sex == "male"), aes(x=Age, fill = Survived)) +
+  geom_histogram(alpha = 0.4, binwidth = 2)+
+  scale_fill_brewer(palette="Dark2")+
+  labs(subtitle = "Male survival by age")
+
+ggplot(tt %>% tidyr::drop_na(Survived) %>% filter(Sex == "female"), aes(x=Age, fill = Survived)) +
+  geom_histogram(alpha = 0.4, binwidth = 2)+
+  scale_fill_brewer(palette="Dark2")+
+  labs(subtitle = "Female survival by age")
+
+ggplot(tt %>% tidyr::drop_na(Survived), aes(x=Age, fill = Survived)) +
+  geom_histogram(alpha = 0.4, binwidth = 2)+
+  scale_fill_brewer(palette="Dark2")+
+  labs(subtitle = "Survival by age")
+
+ggplot(tt %>% tidyr::drop_na(Survived), aes(x = Pclass, fill = Survived))+
+  geom_bar(aes(y = ..count..))+
+  geom_text(stat='count', aes(label=..count..), vjust=-0.5, alpha = 0.5)+
+  labs(subtitle = "Survival by Pclass")
+
+ggplot(tt %>% tidyr::drop_na(Survived), aes(x=Age, fill = Survived)) +
+  facet_wrap(~Pclass)+
+  geom_histogram(alpha = 0.4, binwidth = 2)+
+  scale_fill_brewer(palette="Dark2")+
+  labs(subtitle = "Survival by age and class")
+```
+
+# Feature engineering Part 1/2
+## Extracting the data from Name variable
+
+It appears that Name data also contains some potentially usefull info. 
+So do SibSp (no of siblings/spouses) and Parch (no of parents/children)
+  Creating new variables and insight:
+    Title - there are 14 different titles - some are duplicates Mlle, Ms= Miss and Mme = Mrs I guess
+    Surname - there are 667 different families - maybe its better to use Family Size
+    Family Size - clearly families of 2,3 or 4 are favoured to survive
+      So lets divide it to a cathegories:
+      1 - One
+      2-4 - small
+      over 4 - Large
+
+```{r NamesTitles, echo=FALSE, message=FALSE, warning=FALSE}
+tt$Title <- gsub('(.*, )|(\\..*)', '', tt$Name)
+table(tt$Sex, tt$Title)
+
+# Replacing the same titles but needlessly called different
+tt <- tt %>% 
+  mutate(Title = case_when(Title == 'Mlle' ~ "Miss",
+                           Title == 'Ms' ~ "Miss",
+                           Title == 'Mme' ~ "Mrs",
+                           TRUE ~ Title),
+         FamilySize = Parch+SibSp+1)
+
+ggplot(tt %>% tidyr::drop_na(Survived), aes(x = FamilySize, fill = Survived)) +
+  geom_bar(stat='count', position='dodge') +
+  labs(x = "Survival by Title") +
+  theme_minimal()
+
+ggplot(tt %>% tidyr::drop_na(Survived), aes(x = factor(FamilySize), fill = Survived)) +
+  geom_bar(stat='count', position='dodge') +
+  labs(x = "Survival by Family Size - cathegorical") +
+  theme_minimal()
+
+# Very little occurence of some titles -> calling them "other"
+other_titles <- c("Capt", "Col", "Don", "Jonkheer", "Lady", "Major", "Sir", "the Countess", "Dona")
+
+tt <- tt %>% 
+  mutate(Title = case_when(Title %in% other_titles ~ "Other",
+                           TRUE ~ Title)) %>% 
+  mutate(FamilySizeCat = case_when(FamilySize == 1 ~ "One",
+                                FamilySize>1 & FamilySize<=4 ~ "Small",
+                                FamilySize > 4 ~ "Large"))
+
+ggplot(tt %>% tidyr::drop_na(Survived), aes(x = factor(FamilySizeCat), fill = Survived)) +
+  geom_bar(stat='count', position='dodge') +
+  labs(x = "Survival by Family Size - cathegorical") +
+  theme_minimal()
+
+ggplot(tt %>% tidyr::drop_na(Survived), aes(x = factor(Title), fill = Survived)) +
+  geom_bar(stat='count', position='dodge') +
+  labs(x = "Survival by Title v2") +
+  theme_minimal()
+
+tt$Surname <- as.factor(gsub(",.*", "", tt$Name))
+```
+
+## Location - cabin variable
+
+Location onboard - Cabin variable
+There is a lot of missing info for most people
+Moreover, some people have more than one cabin assignet to their name - usually the numbers are really close so I will just take the first one or skip the numbers and just take the deck? letter and see if there is any correlation with survival rate.
+```{r CabinDeckNo}
+# Extracting the Deck letter from Cabin variable
+tt$Deck <- str_match(tt$Cabin, "[A-Z]")
+```
+
+From the future: I saw that this variable seems really significant. Lets see if improving it can influence the results.
+Checking if info about the cabin is presents has an impact on survival rate - from the experience with some OHSAS systems, knowledge location of people in danger is a significant factor, lets see if this is true:
+```{r cabinv2}
+tt <- tt %>% 
+  mutate(CabinV2 =  factor(case_when(Cabin != "" | is.na(Cabin) ~ "Specified",
+                                     TRUE ~ "Not specified")))
+
+ggplot(tt %>% tidyr::drop_na(Survived), aes(x = CabinV2, fill = Survived))+
+  geom_bar(stat='count', position='dodge')+
+  geom_text(stat='count', aes(label=..count..), alpha = 0.9)+
+  labs(subtitle = "Survival by Cabin Info")
+```
+
+This could be significant when iterating with the structure of RF model.
+
+# Couping with missing data 
+## Embarked variable
+Starting with embark variable, witch is basically the location they started the cruise.
+Lets see what's missing from Embarked:
+
+```{r }
+a <- tt %>% 
+  filter(is.na(Embarked) | Embarked == "")
+```
+So just two people with PassengerId values 62 and 830 - both are from class 1, both were adults and both paid 80$ for their tickets.
+Firstly I have to check if the ticket price varies depending on age to know whether to filter the data by age before guessing the Embark location.
+```{r message=FALSE, warning=FALSE}
+ggplot(tt, aes(x = Age, y = Fare)) +
+  geom_point()+
+  geom_smooth()+
+  facet_wrap(~Pclass)+
+  labs(x = "Does age influences the price of the tickets for given class?")
+```
+
+The graph results seems counter-intuitive indication higher prices for younger passengers especially for Pclass = 1.
+Out of curiosity: Lets see if sex influenced the ticket price.
+```{r sex_ticket_price, echo=TRUE, paged.print=FALSE}
+tt %>% group_by(Sex, Pclass) %>% 
+  summarise(median(Fare, na.rm=T)) # lol it did. shame on them! but we still need the embark location!
+
+# Lets just see the prices Pclass and Embark location for females
+tt %>% 
+  filter(Sex == "female") %>% 
+  group_by(Pclass, Embarked) %>% 
+  summarise(Fare_median = median(Fare, na.rm=T),
+            Fare_mean = mean(Fare),
+            Amount = n())
+
+# Lets dig deeper - Family size vs price ticket - 
+tt %>% 
+  filter(Sex == "female", Pclass == "1") %>% 
+  group_by(FamilySizeCat, Embarked) %>% 
+  summarise(Fare_median = median(Fare, na.rm=T),
+            Fare_mean = mean(Fare),
+            Amount = n()) %>% data.frame()
+```
+
+There is clear difference in ticket price between the classes.
+Without further investigation we can assume that the two women Embarked from port "C", even though "S" is also a probable option, but its inferior fit.
+```{r EmbarkOverride}
+tt$Embarked[c(62, 830)] <- "C"
+```
+
+## Fare variable
+Lets see other missing data. One person ID 1044 does not have Fare price value:
+```{r FareMissing, echo=TRUE, paged.print=FALSE}
+tt %>% 
+  filter(is.na(Fare) | Fare == "")
+```
+
+Lets fit a fare cost based on Embark location, Pclass and sex
+```{r FareOverride, echo=TRUE, paged.print=FALSE}
+ggplot(tt %>% 
+         tidyr::drop_na(Survived) %>% 
+         filter(Pclass == 3 & Embarked == "S" & Sex == "male"), 
+       aes(x = Fare)) +
+  geom_density(fill = 'steelblue', alpha=0.4) + 
+  geom_vline(aes(xintercept=median(Fare, na.rm=T)),
+    colour='darkred', linetype='dashed', alpha = 0.7) +
+  scale_x_continuous(labels=dollar_format())
+
+# Just filling the missing data with median calculated according to filters below:
+tt$Fare[1044] <- tt %>% 
+  filter(Pclass == 3 & Embarked == "S" & Sex == "male") %>%
+  select(Fare) %>%
+  summarise(median(Fare, na.rm = T)) %>%
+  as.numeric()
+```
+
+Make cathegorical variables into factors
+```{r CatToFactor2}
+tt$PassengerId <- as.factor(tt$PassengerId)
+tt$Title <- as.factor(tt$Title)
+tt$FamilySize <- as.factor(tt$FamilySize)
+tt$FamilySizeCat <- as.factor(tt$FamilySizeCat)
+tt$Deck <- as.factor(tt$Deck)
+tt$Survived <- as.factor(tt$Survived)
+```
+
+## Age/Deck - Predictive imputation with mice
+
+```{r MiceModelParam, message=FALSE, warning=FALSE}
+# Set a random seed
+set.seed(111)
+# Perform mice imputation, excluding certain less-than-useful variables:
+mice_mod <- mice(tt[, !names(tt) %in% c('PassengerId','Name','Ticket','Cabin','FamilySize','Surname','Survived')], method='rf')
+```
+Save the complete output:
+```{r MiceOut}
+mice_output <- complete(mice_mod)
+```
+
+```{r AgeDistributionMiceCheck}
+ggplot(tt %>% tidyr::drop_na(Survived), aes(x=Age)) +
+  geom_histogram(alpha = 0.4, binwidth = 2)+
+  labs(subtitle = "Age distribution - original data")
+
+ggplot(mice_output, aes(x=Age)) +
+  geom_histogram(alpha = 0.4, binwidth = 2)+
+  labs(subtitle = "Age distribution - mice data")
+```
+
+Replace the original age data with mice output
+```{r AgeMiceOverride}
+tt$Age <- mice_output$Age
+tt$Deck <- mice_output$Deck
+sum(is.na(tt$Age))
+sum(is.na(tt$Deck))
+```
+
+# Feature engineering Part 2/2
+## Adolescence variable
+Lets create more variables having complete information and check if there is a connection.
+```{r Adolescence}
+tt <- tt %>% 
+  mutate(Adolescence = factor(case_when(Age <= 3 ~ "Baby",
+                                        Age <= 12 ~ "Child",
+                                        Age <= 19 ~ "Teenager",
+                                        Age <= 34 ~ "YoungAdult",
+                                        Age <= 64 ~ "MiddleAged",
+                                        TRUE ~ "Senior"), 
+                              levels = c("Baby", "Child", "Teenager", "YoungAdult", "MiddleAged", "Senior"), 
+                              ordered = T))
+
+ggplot(tt %>% tidyr::drop_na(Survived), aes(x=Adolescence, fill = Survived)) +
+  geom_bar(alpha = 0.4)+
+  labs(subtitle = "Survival by Adolescence",
+       x = NULL)
+```
+
+I have to admit I am happy with that category. 
+
+## Motherhood variable
+Lets see if mothers are favoured to survive.
+
+```{r Motherhood}
+tt <- tt %>% 
+  mutate(Motherhood = factor(case_when(Age < 18 ~ "NotMother",
+                                       Parch == 0 ~ "NotMother",
+                                       Sex == "male" ~ "NotMother",
+                                       Title == "Miss" ~ "NotMother",
+                                       TRUE ~ "Mother")))
+
+ggplot(tt %>% tidyr::drop_na(Survived), aes(x=Motherhood, fill = Survived)) +
+  geom_bar(alpha = 0.4)+
+  labs(subtitle = "Survival by Motherhood",
+       x = NULL)
+```
+
+## Final touches
+Checking if there is missing data:
+```{r fig.height=10, fig.width=27}
+md.pattern(tt)
+```
+There is no missing data. So now is the time to split the dataset to train and test datasets.
+```{r ttsubsetting}
+train <- tt[1:891,]
+test <- tt[892:1309,]
+```
+
+# RandomForest Model
+
+Using randomForest classification algorithm.
+Creating different models to compare the results later.
+```{r randomforestmodel}
+set.seed(666)
+model_RF0 <- randomForest(Survived ~ Pclass + Sex + Age + 
+                                    Fare + Title + 
+                                    FamilySizeCat + Adolescence + Motherhood + Deck,
+                                    data = train, ntree = 2500, mtry = 4)
+print(model_RF0)
+
+model_RF1 <- randomForest(Survived ~ Pclass + Sex + Age + SibSp + Parch + 
+                                    Fare + Title + 
+                                    FamilySizeCat + Adolescence + Motherhood + Deck,
+                                    data = train, ntree = 2500, mtry = 4)
+print(model_RF1)
+
+model_RF2 <- randomForest(Survived ~ Pclass + Sex + Age + SibSp + Parch + 
+                                    Fare + Embarked + Title + 
+                                    FamilySizeCat + Adolescence + Motherhood + Deck,
+                                    data = train, ntree = 2500, mtry = 4)
+print(model_RF2)
+
+model_RF3 <- randomForest(Survived ~ Pclass + Sex + Age + SibSp + Parch + 
+                                    Fare + Embarked + Title + 
+                                    FamilySizeCat + Adolescence + Motherhood + Deck + FamilySize,
+                                    data = train, ntree = 2500, mtry = 4)
+print(model_RF3)
+
+model_RF7 <- randomForest(Survived ~ Pclass + Sex + Age +
+                                    Fare  + Title + 
+                                    Adolescence + Deck + FamilySizeCat,
+                                    data = train, ntree = 1500, mtry = 4)
+print(model_RF7)
+```
+
+For now the best model seems to be the RF3 - Deck is a variable I did not expect to improve the accuracy and have such importance (see Variable Importance).
+Moreover, as a newbie in ML I am not so sure if this is the best way to benchmark the performance of RF models.
+
+```{r}
+# Lets look closely at our best model
+model_RF <- model_RF3
+```
+
+
+Visualising the trees (possible to use max instead of min for not simplified view)
+Reference: https://shiring.github.io/machine_learning/2017/03/16/rf_plot_ggraph
+```{r treeview, fig.height=27, fig.width=27}
+# tree_num <- which(model_RF$forest$ndbigtree == min(model_RF$forest$ndbigtree))
+# tree_func(final_model = model_RF, tree_num)
+```
+
+## Variable importance (Gini importance?):
+```{r VarImportance}
+importance    <- importance(model_RF)
+varImportance <- data.frame(Variables = row.names(importance), 
+                            Importance = round(importance[ ,'MeanDecreaseGini'],2))
+```
+
+Creating rank variable based on Gini importance(? dunno if this is precise statement - correct me if accordingly in comments):
+```{r rankimportance}
+# Create a rank variable based on importance
+rankImportance <- varImportance %>%
+  mutate(Rank = paste0('#',dense_rank(desc(Importance))))
+```
+
+Relative variable importance on bar plot:
+```{r viewimportance}
+ggplot(rankImportance, aes(x = reorder(Variables, Importance), 
+    y = Importance, fill = Importance)) +
+  geom_bar(stat='identity') + 
+  labs(
+    subtitle = "Relative variable importance",
+    x = NULL) +
+  coord_flip() + 
+  theme_minimal()
+```
+
+In literature I saw that the default importance indicator in 'randomForest' isn't the best. I saw some nice examples of implementations of permutation feature importance. I won't do this in this projects as I don't want to waste too much time. For your and my own future reference I will include the links to the sources I found:
+https://medium.com/@azuranski/permutation-feature-importance-in-r-randomforest-26fd8bc7a569
+https://bmcbioinformatics.biomedcentral.com/articles/10.1186/1471-2105-8-25
+https://koalaverse.github.io/homlr/notebooks/11-random-forests.nb.html
+
+## Tuning the model
+
+After spending some time picking manually the best combinations of variables I thought that there should be a better automated way of doing this since the calculations are not so robust and searching for optimal parameters should not be done manually. Thus, I decided to do some digging. I found some YT videos and read some articles. After trying some methods I decided to use 'caret' package and implement the approach from this article:
+https://machinelearningmastery.com/tune-machine-learning-algorithms-in-r/
+
+Basically I decided to firstly find the best value for mtry and then the optimal ntree value, while skipping potential interaction effects between the parameters.
+
+Lets try Grid Search method to find best value for mtry (no. of variables randomly sampled as candidates at each tree split):
+
+```{r tuningRF_mtry1}
+set.seed(seed = 7)
+# Create model with default parameters
+training <- train %>% 
+  select(Pclass, Sex, Age, SibSp, Parch, Fare, Embarked,
+         Title, FamilySizeCat, Adolescence, Motherhood, 
+         Deck, FamilySize, CabinV2, 
+         Survived)
+
+rf_default <- train(Survived~., 
+                    data=training, 
+                    method="rf", 
+                    metric="Accuracy", 
+                    tuneGrid=expand.grid(.mtry=c(1:10)), 
+                    trControl=trainControl(method="repeatedcv", number=10, repeats=3, search="grid"))
+print(rf_default)
+plot(rf_default)
+```
+
+Since I know what exact parameters were the best from previous manual picks, I will rerun the code above while feeding only the variables from model_RF3. So basically the only difference to previous step would be not to use CabinV2 variable. I know it is needless, but wanted to show all my steps I took to achieve the results.
+
+```{r tuningRF_ntree}
+set.seed(seed = 666)
+
+training <- train %>%
+  select(Pclass,
+         Sex,
+         Age,
+         Fare,
+         Title,
+         FamilySizeCat,
+         Adolescence,
+         Motherhood,
+         Deck,
+         Survived) 
+
+# Manual Search
+modellist <- list()
+
+for (ntree in c(1600, 1650, 1700, 1750, 1800, 1850, 1900, 1950, 2000)) {
+	
+  fit <- train(Survived~.,
+               data=training,
+               method="rf",
+               metric="Accuracy",
+               tuneGrid = expand.grid(.mtry=4),
+	             ntree = ntree)
+	
+	key <- toString(ntree)
+	modellist[[key]] <- fit
+}
+
+# compare results
+results <- resamples(modellist)
+summary(results)
+dotplot(results)
+```
+
+I will pick model with ntree = 2000, having accuracy median of 0.8314607 and mean accuracy of 0.8301858. Finally, I have selected more or less optimal parameters for the RF model. Lets set the parameters, rank the variables and make a prediction.
+
+Making better model based on vars from model_RF2
+```{r}
+set.seed( seed = 666)
+
+training <- train %>%
+  select(Pclass,
+         Sex,
+         Age,
+         Fare,
+         Title,
+         FamilySizeCat,
+         Adolescence,
+         Motherhood,
+         Deck,
+         Survived) 
+
+model_RF <- train(Survived~., 
+                    data=training, 
+                    method="rf", 
+                    metric="Accuracy", 
+                    tuneGrid=expand.grid(.mtry=4),
+             trControl=trainControl(method="repeatedcv", number=10, repeats=3),
+             ntree = 1800)
+print(model_RF)
+# plot(model_RF)
+```
+
+
+## Model error and trees visualisation
+
+Lets compare different confusion matrices to start with. 
+```{r RFmodelError}
+plot(model_RF)
+model_RF$confusion
+```
+
+## Updated Variable importance
+```{r VarImportance}
+# importance    <- importance(model_RF)
+# varImportance <- data.frame(Variables = row.names(importance), 
+#                             Importance = round(importance[ ,'MeanDecreaseGini'],2))
+```
+
+Creating rank variable based on Gini importance(? dunno if this is precise statement - correct me if accordingly in comments):
+```{r rankimportance}
+# Create a rank variable based on importance
+# rankImportance <- varImportance %>%
+#   mutate(Rank = paste0('#',dense_rank(desc(Importance))))
+```
+
+Relative variable importance on bar plot:
+```{r viewimportance}
+# ggplot(rankImportance, aes(x = reorder(Variables, Importance), 
+#     y = Importance, fill = Importance)) +
+#   geom_bar(stat='identity') + 
+#   labs(
+#     subtitle = "Relative variable importance",
+#     x = NULL) +
+#   coord_flip() + 
+#   theme_minimal()
+```
+
+# Making prediction
+```{r pred0}
+prediction <- predict(model_RF, test)
+
+solution <- data.frame(PassengerID = test$PassengerId, Survived = prediction)
+solution %>% str()
+
+solution <- solution %>% 
+  mutate(PassengerID = as.integer(PassengerID),
+         Survived = as.integer(Survived)-1)
+
+write.csv(solution, file = 'RF_mod_Solution.csv', row.names = F)
+# Kaggle score 0.78229
+```
+
+Alternate predictions
+```{r pred1}
+prediction1 <- predict(modellist$`1700`, test)
+
+solution <- data.frame(PassengerID = test$PassengerId, Survived = prediction1)
+solution %>% str()
+
+solution <- solution %>% 
+  mutate(PassengerID = as.integer(PassengerID),
+         Survived = as.integer(Survived)-1)
+
+write.csv(solution, file = 'RF_mod_Solution9.csv', row.names = F)
+```
+
+```{r pred2}
+prediction2 <- predict(model_RF7, test)
+
+solution <- data.frame(PassengerID = test$PassengerId, Survived = prediction2)
+solution %>% str()
+
+solution <- solution %>% 
+  mutate(PassengerID = as.integer(PassengerID),
+         Survived = as.integer(Survived)-1)
+
+write.csv(solution, file = 'RF_mod_Solution2.csv', row.names = F)
+```
+
